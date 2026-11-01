@@ -1,0 +1,65 @@
+name: Build APK
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unpack project
+        run: |
+          if [ ! -d oath-of-ashes-android ]; then unzip -q oath-of-ashes-android*.zip; fi
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+      - uses: android-actions/setup-android@v3
+      - name: Create Android project
+        working-directory: oath-of-ashes-android
+        run: |
+          npm install
+          npx cap add android
+          bash ./patch-android.sh
+          npx cap sync android
+      - name: Build release APK
+        working-directory: oath-of-ashes-android/android
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleRelease
+      - name: Sign APK
+        working-directory: oath-of-ashes-android
+        env:
+          SIGNING_KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        run: |
+          BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
+          IN=android/app/build/outputs/apk/release/app-release-unsigned.apk
+          mkdir -p dist
+          "$BT/zipalign" -f 4 "$IN" aligned.apk
+          if [ -n "$SIGNING_KEYSTORE_BASE64" ]; then
+            echo "$SIGNING_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            KS="$RUNNER_TEMP/release.jks"; SP="$SIGNING_STORE_PASSWORD"; KA="$SIGNING_KEY_ALIAS"; KP="${SIGNING_KEY_PASSWORD:-$SIGNING_STORE_PASSWORD}"
+          else
+            echo "::warning::No signing secrets: using a throwaway key"
+            KS="$RUNNER_TEMP/tmp.jks"; SP=android; KA=tmp; KP=android
+            keytool -genkeypair -keystore "$KS" -alias tmp -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass android -keypass android -dname "CN=Oath of Ashes"
+          fi
+          "$BT/apksigner" sign --ks "$KS" --ks-pass "pass:$SP" --ks-key-alias "$KA" --key-pass "pass:$KP" \
+            --out "dist/OathOfAshes-${GITHUB_SHA::7}.apk" aligned.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OathOfAshes-apk
+          path: oath-of-ashes-android/dist/*.apk
+      - name: Attach APK to GitHub Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" oath-of-ashes-android/dist/*.apk --title "$GITHUB_REF_NAME" --notes "Oath of Ashes $GITHUB_REF_NAME" || gh release upload "$GITHUB_REF_NAME" oath-of-ashes-android/dist/*.apk --clobber
